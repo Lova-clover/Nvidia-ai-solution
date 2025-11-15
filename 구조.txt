@@ -1,0 +1,9 @@
+Nvidia_project/
+  ├─ config.py          # 환경변수 + 공통 상수/파라미터
+  ├─ models.py         # YOLO, PaddleOCR 로딩 (여기서 ocr 한 번만 생성)
+  ├─ tracking.py        # Kalman + MultiObjectTracker
+  ├─ calorie.py         # ArUco 스케일 + 칼로리 추정
+  ├─ ocr_utils.py       # Food/Drink용 OCR 유틸 + 영양 분석
+  ├─ detection.py      # 한 프레임 처리(detect_step)
+  ├─ main.py            # 음식/음료 카메라 실시간 (FoodDetection_OCR 대체)
+  └─ DrugDetection.py   # 약/처방전 이미지 OCR (단일 이미지)
