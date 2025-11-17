@@ -1,3 +1,4 @@
+# ocr_utils.py
 import os
 import tempfile
 import re
@@ -6,18 +7,19 @@ import cv2
 
 from models import ocr
 
+
 def _run_paddle_ocr(image_bgr):
     """
     PaddleOCR 3.x 파이프라인 기준:
-    - 항상 일정 이상 크게 스케일업해서 OCR
+    - 텍스트 인식률 강화를 위해 스케일업 + 대비 향상 후 OCR
     - predict() 결과에서 rec_texts만 뽑아 텍스트 라인 리스트로 반환
     """
     if image_bgr is None or image_bgr.size == 0:
         return []
 
-    # 짧은 변이 최소 256px 되도록 스케일업 (텍스트 인식률 강화)
+    # 1) 짧은 변이 최소 320~384px 되도록 스케일업 (텍스트 인식률 크게 강화)
     h, w = image_bgr.shape[:2]
-    TARGET_SHORT = 256
+    TARGET_SHORT = 384
     min_side = min(h, w)
     if min_side < TARGET_SHORT:
         scale = TARGET_SHORT / max(1, min_side)
@@ -25,11 +27,17 @@ def _run_paddle_ocr(image_bgr):
         new_h = int(h * scale)
         image_bgr = cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-    # 1차 시도: numpy 배열 그대로 predict
+    # 2) 대비/선명도 강화 (곡면 라벨용)
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    image_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    # 3) 1차 시도: numpy 배열 그대로 predict
     try:
         result = ocr.predict(image_bgr)
     except Exception:
-        # 2차 시도: 임시 파일로 저장 후 경로 기반 predict
+        # 4) 2차 시도: 임시 파일로 저장 후 경로 기반 predict
         fd, tmp_path = tempfile.mkstemp(suffix=".png")
         os.close(fd)
         try:
@@ -56,23 +64,29 @@ def _run_paddle_ocr(image_bgr):
     return lines
 
 
-def ocr_text_from_crop(frame_bgr, bbox):
+def ocr_text_from_crop(frame_bgr, bbox, global_cls=None):
     """
-    확정된 Drink(병/컵) 박스를 여러 패딩으로 크롭해서
-    - 각 크롭을 좌우반전(거울 프레임 복원)
-    - _run_paddle_ocr()로 OCR 수행
-    - 텍스트 라인을 가장 많이 뽑은 버전을 최종 결과로 선택
+    확정된 객체 박스에서 텍스트를 잘라 OCR.
+    - 공통: bbox 전체 + 패딩 여러 단계로 OCR (라벨/성분표 전체 커버)
+    - Drink(2): 병/컵 안에서 '라벨/성분표 띠'로 보이는 세로 밴드를 추가로 크롭해서 OCR
+    - 두 결과를 합쳐서(중복 제거) 반환
     """
     if ocr is None:
         return []
 
     H, W = frame_bgr.shape[:2]
     x1, y1, x2, y2 = bbox
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(W, x2); y2 = min(H, y2)
+    if x2 <= x1 or y2 <= y1:
+        return []
 
-    best_lines = []
-    best_len   = 0
+    all_lines = []
 
-    # 패딩 3단계: 좁게/보통/넓게
+    # -------------------------
+    # 0) 공통: bbox 전체 + 패딩 여러 단계
+    #    → 라벨/성분표 전체를 한 번 훑는 역할
+    # -------------------------
     for pad in (20, 60, 120):
         xx1 = max(0, x1 - pad)
         yy1 = max(0, y1 - pad)
@@ -89,19 +103,59 @@ def ocr_text_from_crop(frame_bgr, bbox):
         # 프레임이 거울 모드라 crop만 다시 좌우반전해서 텍스트 방향 복원
         crop = cv2.flip(crop, 1)
 
-        # OCR 수행
         lines = _run_paddle_ocr(crop)
-        lines = [l for l in lines if l.strip()]
+        for t in lines:
+            t = t.strip()
+            if t:
+                all_lines.append(t)
 
-        if len(lines) > best_len:
-            best_len   = len(lines)
-            best_lines = lines
+    # -------------------------
+    # 1) Drink(2): 라벨/성분표가 있을 법한 세로 밴드를 추가 스캔
+    #    → 멀리서 찍은 병에서도 글자 밀집 구역을 더 강하게 읽어옴
+    # -------------------------
+    if global_cls == 2:
+        h_box = y2 - y1
+        band_fracs = [(0.2, 0.6), (0.3, 0.7), (0.4, 0.9)]
+        pads = (10, 30, 60)
 
-        # 어느 정도 읽혔으면(3줄 이상) 더 넓은 패딩은 굳이 안 봐도 됨
-        if best_len >= 3:
-            break
+        for (f1, f2) in band_fracs:
+            by1 = int(y1 + f1 * h_box)
+            by2 = int(y1 + f2 * h_box)
+            by1 = max(y1, min(by1, y2))
+            by2 = max(y1, min(by2, y2))
+            if by2 <= by1:
+                continue
 
-    return best_lines
+            for pad in pads:
+                xx1 = max(0, x1 - pad)
+                xx2 = min(W, x2 + pad)
+                yy1 = max(0, by1 - pad)
+                yy2 = min(H, by2 + pad)
+
+                if xx2 <= xx1 or yy2 <= yy1:
+                    continue
+
+                crop = frame_bgr[yy1:yy2, xx1:xx2]
+                if crop.size == 0:
+                    continue
+
+                crop = cv2.flip(crop, 1)
+
+                lines = _run_paddle_ocr(crop)
+                for t in lines:
+                    t = t.strip()
+                    if t:
+                        all_lines.append(t)
+
+    # -------------------------
+    # 2) 중복 제거 + 정리
+    # -------------------------
+    uniq = []
+    for t in all_lines:
+        if t not in uniq:
+            uniq.append(t)
+
+    return uniq
 
 def parse_nutrient(text, key):
     """'당류 12 g' 형태에서 숫자 파싱."""
@@ -118,6 +172,7 @@ def parse_nutrient(text, key):
         except Exception:
             pass
     return None
+
 
 def categorize_drink(text):
     """텍스트에서 음료 타입/제로 여부 대략 분류."""
@@ -162,6 +217,7 @@ def categorize_drink(text):
             return "water", is_zero, k
 
     return "unknown", is_zero, ""
+
 
 def analyze_drink_nutrition(lines):
     """음료 OCR 텍스트 기반 당뇨 위험 분석."""
